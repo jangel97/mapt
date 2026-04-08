@@ -31,20 +31,25 @@ var (
 	}
 )
 
-// deployServerless installs the Serverless operator and deploys the requested
-// Knative components (Serving, Eventing, or both).
-func deployServerless(ctx *pulumi.Context, args *DeployArgs, serving, eventing bool) error {
+// deployServerlessWithPrereqs installs the Serverless operator and deploys the
+// requested Knative components. When needAI is true, the serving readiness
+// output is appended to aiPrereqs for the AI profile to chain on.
+func deployServerlessWithPrereqs(ctx *pulumi.Context, args *DeployArgs, serving, eventing, needAI bool, aiPrereqs *[]pulumi.StringOutput) error {
 	operatorReady, err := deployServerlessOperator(ctx, args)
 	if err != nil {
 		return err
 	}
 	if serving {
-		if _, err := deployKnativeServing(ctx, args, operatorReady); err != nil {
+		_, ksReady, err := deployKnativeServing(ctx, args, operatorReady)
+		if err != nil {
 			return err
+		}
+		if needAI {
+			*aiPrereqs = append(*aiPrereqs, ksReady)
 		}
 	}
 	if eventing {
-		if _, err := deployKnativeEventing(ctx, args, operatorReady); err != nil {
+		if _, _, err := deployKnativeEventing(ctx, args, operatorReady); err != nil {
 			return err
 		}
 	}
@@ -52,84 +57,19 @@ func deployServerless(ctx *pulumi.Context, args *DeployArgs, serving, eventing b
 }
 
 // deployServerlessOperator installs the OpenShift Serverless operator and waits
-// for the CSV to succeed. It returns a pulumi.StringOutput that resolves after
-// the operator is ready, suitable for threading namespace names through ApplyT.
+// for the CSV to succeed.
 func deployServerlessOperator(ctx *pulumi.Context, args *DeployArgs) (pulumi.StringOutput, error) {
-	goCtx := ctx.Context()
 	rn := func(suffix string) string {
 		return fmt.Sprintf("%s-serverless-%s", args.Prefix, suffix)
 	}
-
-	// Create openshift-serverless namespace
-	ns, err := corev1.NewNamespace(ctx, rn("ns"),
-		&corev1.NamespaceArgs{
-			Metadata: &metav1.ObjectMetaArgs{
-				Name: pulumi.String(serverlessNamespace),
-			},
-		},
-		pulumi.Provider(args.K8sProvider),
-		pulumi.DependsOn(args.Deps))
-	if err != nil {
-		return pulumi.StringOutput{}, err
-	}
-
-	// Create OperatorGroup (AllNamespaces — empty spec)
-	og, err := apiextensions.NewCustomResource(ctx, rn("og"),
-		&apiextensions.CustomResourceArgs{
-			ApiVersion: pulumi.String("operators.coreos.com/v1"),
-			Kind:       pulumi.String("OperatorGroup"),
-			Metadata: &metav1.ObjectMetaArgs{
-				Name:      pulumi.String("serverless-operators"),
-				Namespace: pulumi.String(serverlessNamespace),
-			},
-			OtherFields: map[string]interface{}{
-				"spec": map[string]interface{}{},
-			},
-		},
-		pulumi.Provider(args.K8sProvider),
-		pulumi.DependsOn([]pulumi.Resource{ns}))
-	if err != nil {
-		return pulumi.StringOutput{}, err
-	}
-
-	// Create Subscription
-	sub, err := apiextensions.NewCustomResource(ctx, rn("sub"),
-		&apiextensions.CustomResourceArgs{
-			ApiVersion: pulumi.String("operators.coreos.com/v1alpha1"),
-			Kind:       pulumi.String("Subscription"),
-			Metadata: &metav1.ObjectMetaArgs{
-				Name:      pulumi.String("serverless-operator"),
-				Namespace: pulumi.String(serverlessNamespace),
-			},
-			OtherFields: map[string]interface{}{
-				"spec": map[string]interface{}{
-					"source":              "redhat-operators",
-					"sourceNamespace":     "openshift-marketplace",
-					"name":                "serverless-operator",
-					"channel":             "stable",
-					"installPlanApproval": "Automatic",
-				},
-			},
-		},
-		pulumi.Provider(args.K8sProvider),
-		pulumi.DependsOn([]pulumi.Resource{og}))
-	if err != nil {
-		return pulumi.StringOutput{}, err
-	}
-
-	// Wait for CSV to succeed (operator fully installed).
-	operatorReady := pulumi.All(sub.ID(), args.Kubeconfig).ApplyT(
-		func(allArgs []interface{}) (string, error) {
-			kc := allArgs[1].(string)
-			if err := waitForCRCondition(goCtx, kc, csvGVR,
-				serverlessNamespace, "serverless-operator",
-				"", "Succeeded", 20*time.Minute, true); err != nil {
-				return "", fmt.Errorf("waiting for Serverless CSV: %w", err)
-			}
-			return "ready", nil
-		}).(pulumi.StringOutput)
-
-	return operatorReady, nil
+	return installOperator(ctx, args, operatorInstall{
+		resourcePrefix: rn(""),
+		namespace:      serverlessNamespace,
+		ogName:         "serverless-operators",
+		subName:        "serverless-operator",
+		packageName:    "serverless-operator",
+		csvPrefix:      "serverless-operator",
+	})
 }
 
 // knativeCRArgs describes a Knative custom resource to deploy.
@@ -144,8 +84,8 @@ type knativeCRArgs struct {
 
 // deployKnativeCR is the shared implementation for deploying a Knative CR
 // (Serving or Eventing). It creates the target namespace, the CR, and waits
-// for it to become ready.
-func deployKnativeCR(ctx *pulumi.Context, args *DeployArgs, operatorReady pulumi.StringOutput, cr knativeCRArgs) (pulumi.Resource, error) {
+// for it to become ready. Returns the resource and a readiness output.
+func deployKnativeCR(ctx *pulumi.Context, args *DeployArgs, operatorReady pulumi.StringOutput, cr knativeCRArgs) (pulumi.Resource, pulumi.StringOutput, error) {
 	goCtx := ctx.Context()
 	rn := func(s string) string {
 		return fmt.Sprintf("%s-serverless-%s", args.Prefix, s)
@@ -163,10 +103,9 @@ func deployKnativeCR(ctx *pulumi.Context, args *DeployArgs, operatorReady pulumi
 				Name: nsName,
 			},
 		},
-		pulumi.Provider(args.K8sProvider),
-		pulumi.DependsOn(args.Deps))
+		args.k8sOpts(pulumi.DependsOn(args.Deps))...)
 	if err != nil {
-		return nil, err
+		return nil, pulumi.StringOutput{}, err
 	}
 
 	// Create the Knative CR
@@ -179,10 +118,9 @@ func deployKnativeCR(ctx *pulumi.Context, args *DeployArgs, operatorReady pulumi
 				Namespace: pulumi.String(cr.namespace),
 			},
 		},
-		pulumi.Provider(args.K8sProvider),
-		pulumi.DependsOn([]pulumi.Resource{ns}))
+		args.k8sOpts(pulumi.DependsOn([]pulumi.Resource{ns}))...)
 	if err != nil {
-		return nil, err
+		return nil, pulumi.StringOutput{}, err
 	}
 
 	// Wait for the CR to be ready
@@ -199,11 +137,11 @@ func deployKnativeCR(ctx *pulumi.Context, args *DeployArgs, operatorReady pulumi
 
 	ctx.Export(cr.exportKey, ready)
 
-	return res, nil
+	return res, ready, nil
 }
 
 // deployKnativeServing creates a KnativeServing CR and waits for it to be ready.
-func deployKnativeServing(ctx *pulumi.Context, args *DeployArgs, operatorReady pulumi.StringOutput) (pulumi.Resource, error) {
+func deployKnativeServing(ctx *pulumi.Context, args *DeployArgs, operatorReady pulumi.StringOutput) (pulumi.Resource, pulumi.StringOutput, error) {
 	return deployKnativeCR(ctx, args, operatorReady, knativeCRArgs{
 		suffix:    "ks",
 		namespace: knativeServingNamespace,
@@ -215,7 +153,7 @@ func deployKnativeServing(ctx *pulumi.Context, args *DeployArgs, operatorReady p
 }
 
 // deployKnativeEventing creates a KnativeEventing CR and waits for it to be ready.
-func deployKnativeEventing(ctx *pulumi.Context, args *DeployArgs, operatorReady pulumi.StringOutput) (pulumi.Resource, error) {
+func deployKnativeEventing(ctx *pulumi.Context, args *DeployArgs, operatorReady pulumi.StringOutput) (pulumi.Resource, pulumi.StringOutput, error) {
 	return deployKnativeCR(ctx, args, operatorReady, knativeCRArgs{
 		suffix:    "ke",
 		namespace: knativeEventingNamespace,

@@ -14,6 +14,8 @@ const (
 	ProfileServerlessServing  = "serverless-serving"
 	ProfileServerlessEventing = "serverless-eventing"
 	ProfileServerless         = "serverless"
+	ProfileServiceMesh        = "servicemesh"
+	ProfileOpenShiftAI        = "ai"
 )
 
 // profileEffect describes what a profile requires when deployed.
@@ -21,6 +23,7 @@ type profileEffect struct {
 	nestedVirt bool
 	serving    bool
 	eventing   bool
+	minCPUs    int32
 	deployFn   func(ctx *pulumi.Context, args *DeployArgs) (pulumi.Resource, error)
 }
 
@@ -31,6 +34,15 @@ var profileRegistry = map[string]profileEffect{
 	ProfileServerlessServing:  {serving: true},
 	ProfileServerlessEventing: {eventing: true},
 	ProfileServerless:         {serving: true, eventing: true},
+	ProfileServiceMesh:        {deployFn: deployServiceMesh},
+	ProfileOpenShiftAI:        {serving: true, minCPUs: 16},
+}
+
+// incompatibleProfiles lists pairs of profiles that cannot be combined.
+var incompatibleProfiles = [][2]string{
+	// AI uses Service Mesh v2 (Maistra); the servicemesh profile deploys v3 (Sail).
+	// Both target istio-system and are incompatible on the same cluster.
+	{ProfileOpenShiftAI, ProfileServiceMesh},
 }
 
 // DeployArgs holds the arguments needed by a profile to deploy
@@ -40,9 +52,15 @@ type DeployArgs struct {
 	Kubeconfig  pulumi.StringOutput
 	Prefix      string
 	Deps        []pulumi.Resource
+	// DeletedWith is the compute resource (EC2 instance or ASG) that hosts
+	// the cluster. When set, K8s resources are marked with pulumi.DeletedWith
+	// so that Pulumi skips deleting them individually during destroy — the
+	// resources disappear when the VM is terminated.
+	DeletedWith pulumi.Resource
 }
 
-// Validate checks that all requested profiles are supported.
+// Validate checks that all requested profiles are supported and
+// that there are no incompatible combinations.
 func Validate(profiles []string) error {
 	for _, p := range profiles {
 		if _, ok := profileRegistry[p]; !ok {
@@ -50,15 +68,23 @@ func Validate(profiles []string) error {
 				p, slices.Sorted(maps.Keys(profileRegistry)))
 		}
 	}
+	for _, pair := range incompatibleProfiles {
+		if slices.Contains(profiles, pair[0]) && slices.Contains(profiles, pair[1]) {
+			return fmt.Errorf("profiles %q and %q cannot be combined", pair[0], pair[1])
+		}
+	}
 	return nil
 }
 
 // Deploy deploys all requested profiles on the SNC cluster.
 // It ensures shared dependencies (e.g. the Serverless operator) are only
-// installed once, even when multiple serverless profiles are requested.
+// installed once, even when multiple profiles require them.
+// The AI profile implicitly brings in Service Mesh v2 (Maistra) and
+// serverless-serving as prerequisites for Kserve.
 func Deploy(ctx *pulumi.Context, profiles []string, args *DeployArgs) error {
 	needServing := false
 	needEventing := false
+	needAI := false
 
 	for _, p := range profiles {
 		effect := profileRegistry[p]
@@ -69,10 +95,32 @@ func Deploy(ctx *pulumi.Context, profiles []string, args *DeployArgs) error {
 		}
 		needServing = needServing || effect.serving
 		needEventing = needEventing || effect.eventing
+		if p == ProfileOpenShiftAI {
+			needAI = true
+		}
+	}
+
+	// Collect readiness outputs from prerequisite profiles so that
+	// dependent profiles (e.g. AI) can wait for them.
+	var aiPrereqs []pulumi.StringOutput
+
+	// AI requires Service Mesh v2 (Maistra) — separate from the v3 (Sail) profile
+	if needAI {
+		_, smcpReady, err := deployServiceMeshV2(ctx, args)
+		if err != nil {
+			return err
+		}
+		aiPrereqs = append(aiPrereqs, smcpReady)
 	}
 
 	if needServing || needEventing {
-		if err := deployServerless(ctx, args, needServing, needEventing); err != nil {
+		if err := deployServerlessWithPrereqs(ctx, args, needServing, needEventing, needAI, &aiPrereqs); err != nil {
+			return err
+		}
+	}
+
+	if needAI {
+		if _, err := deployOpenShiftAI(ctx, args, aiPrereqs); err != nil {
 			return err
 		}
 	}
@@ -89,6 +137,30 @@ func RequireNestedVirt(profiles []string) bool {
 		}
 	}
 	return false
+}
+
+// MinCPUs returns the minimum number of CPUs required by the
+// given set of profiles. If no profile needs extra resources it returns 0
+// (meaning "use the default").
+func MinCPUs(profiles []string) int32 {
+	var max int32
+	for _, p := range profiles {
+		if effect, ok := profileRegistry[p]; ok && effect.minCPUs > max {
+			max = effect.minCPUs
+		}
+	}
+	return max
+}
+
+// k8sOpts returns the common Pulumi resource options for K8s resources:
+// the K8s provider and (when set) the DeletedWith option. Extra options
+// (e.g. DependsOn) can be appended.
+func (a *DeployArgs) k8sOpts(extra ...pulumi.ResourceOption) []pulumi.ResourceOption {
+	opts := []pulumi.ResourceOption{pulumi.Provider(a.K8sProvider)}
+	if a.DeletedWith != nil {
+		opts = append(opts, pulumi.DeletedWith(a.DeletedWith))
+	}
+	return append(opts, extra...)
 }
 
 // NewK8sProvider creates a Pulumi Kubernetes provider from a kubeconfig string output.

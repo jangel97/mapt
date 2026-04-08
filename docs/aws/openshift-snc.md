@@ -62,7 +62,7 @@ mapt aws openshift-snc create \
     --profile virtualization
 ```
 
-Multiple profiles can be specified as a comma-separated list (e.g., `--profile virtualization,serverless-serving`).
+Multiple profiles can be specified as a comma-separated list (e.g., `--profile virtualization,ai`).
 
 ### Available profiles
 
@@ -72,12 +72,14 @@ Multiple profiles can be specified as a comma-separated list (e.g., `--profile v
 | `serverless-serving` | Installs [OpenShift Serverless](https://docs.openshift.com/serverless/latest/about/about-serverless.html) and creates a KnativeServing instance, enabling serverless workloads (Knative Serving) on the cluster.|
 | `serverless-eventing` | Installs [OpenShift Serverless](https://docs.openshift.com/serverless/latest/about/about-serverless.html) and creates a KnativeEventing instance, enabling event-driven workloads (Knative Eventing) on the cluster.|
 | `serverless` | Installs [OpenShift Serverless](https://docs.openshift.com/serverless/latest/about/about-serverless.html) and creates both KnativeServing and KnativeEventing instances.|
+| `servicemesh` | Installs [OpenShift Service Mesh 3](https://docs.openshift.com/service-mesh/latest/about/about-ossm.html) (Sail/Istio) on the cluster, deploying IstioCNI and an Istio control plane.|
+| `ai` | Installs [Red Hat OpenShift AI](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed) (RHOAI) on the cluster. Automatically installs Service Mesh v2 (Maistra) and Serverless Serving as prerequisites for Kserve. All three operators install in parallel; the DataScienceCluster CR is only created once Service Mesh and Serverless are fully ready. The minimum instance size is raised to 16 vCPUs (from the default 8) to accommodate the additional operators. **Cannot be combined with the `servicemesh` profile** (which deploys Service Mesh v3/Sail).|
 
 
 ### Adding new profiles
 
 To add a new profile:
 
-1. Create `profile_<name>.go` under `pkg/target/service/snc/` — Go file with a `deploy<Name>()` function that uses the Pulumi Kubernetes provider to create the required resources (Namespace, OperatorGroup, Subscription, CRs, etc.)
-2. Register the profile name in `profiles.go` by adding it to `validProfiles` and the `DeployProfile()` switch
+1. Create `<name>.go` under `pkg/target/service/snc/profile/` — Go file with a `deploy<Name>()` function that uses the Pulumi Kubernetes provider to create the required resources (Namespace, OperatorGroup, Subscription, CRs, etc.)
+2. Register the profile in `profile.go` by adding it to the `profileRegistry` map
 
